@@ -4,11 +4,11 @@ from minecraft.authentication import _make_request
 from minecraft.authentication import _raise_from_response
 from minecraft.exceptions import YggdrasilError
 
+from unittest import mock
+import unittest
 import requests
 import json
-import unittest
 import os
-from .compat import mock
 
 FAKE_DATA = {
     "id_": "85e2c12b9eab4a7dabf61babc11354c2",
@@ -47,22 +47,14 @@ def get_mc_credentials():
 username, password = get_mc_credentials()
 
 
-def should_skip_cred_test():
-    """
-    Returns `True` if a test requiring credentials should be skipped.
-    Otherwise returns `False`
-    """
-    if username is None or password is None:
-        return True
-    return False
+skipIfNoCredentials = unittest.skipIf(
+    username is None or password is None,
+    "Need credentials to perform test.")
 
 
-def should_run_internet_tests():
-    """
-    Returns `True` if tests involving access to Internet resources
-    should *not* be skipped. Otherwise returns `False`.
-    """
-    return os.environ.get('PYCRAFT_RUN_INTERNET_TESTS')
+skipUnlessInternetTestsEnabled = unittest.skipUnless(
+    os.environ.get('PYCRAFT_RUN_INTERNET_TESTS'),
+    "Tests involving Internet access are disabled.")
 
 
 class InitProfile(unittest.TestCase):
@@ -184,6 +176,7 @@ class AuthenticateAuthenticationToken(unittest.TestCase):
         with self.assertRaises(TypeError):
             a.authenticate("username")
 
+    @skipUnlessInternetTestsEnabled
     def test_authenticate_wrong_credentials(self):
         a = AuthenticationToken()
 
@@ -191,11 +184,13 @@ class AuthenticateAuthenticationToken(unittest.TestCase):
         with self.assertRaises(YggdrasilError) as cm:
             a.authenticate("Billy", "The Goat")
 
-        err = "Invalid credentials. Invalid username or password."
-        self.assertEqual(cm.exception.yggdrasil_message, err)
+        err = "[403] ForbiddenOperationException: " \
+              "'Invalid credentials. Invalid username or password.'"
+        self.maxDiff = 5000
+        self.assertEqual(str(cm.exception), err)
 
-    @unittest.skipIf(should_skip_cred_test(),
-                     "Need credentials to perform test.")
+    @skipIfNoCredentials
+    @skipUnlessInternetTestsEnabled
     def test_authenticate_good_credentials(self):
         a = AuthenticationToken()
 
@@ -203,8 +198,7 @@ class AuthenticateAuthenticationToken(unittest.TestCase):
         self.assertTrue(resp)
 
 
-@unittest.skipUnless(should_run_internet_tests(),
-                     "Tests involving Internet access are disabled.")
+@skipUnlessInternetTestsEnabled
 class MakeRequest(unittest.TestCase):
     def test_make_request_http_method(self):
         res = _make_request(AUTHSERVER, "authenticate", {"Billy": "Bob"})
@@ -306,6 +300,10 @@ class NormalConnectionProcedure(unittest.TestCase):
 
         def mocked_make_request(server, endpoint, data):
             if endpoint == "authenticate":
+                if "accessToken" in data:
+                    response = successful_res.copy()
+                    response.json["accessToken"] = data["accessToken"]
+                    return response
                 return successful_res
             if endpoint == "refresh" and data["accessToken"] == "token":
                 return successful_res
@@ -329,6 +327,9 @@ class NormalConnectionProcedure(unittest.TestCase):
             self.assertFalse(a.authenticated)
             self.assertTrue(a.authenticate("username", "password"))
 
+            self.assertEqual(_make_request_mock.call_count, 1)
+            self.assertIn("clientToken", _make_request_mock.call_args[0][2])
+
             self.assertTrue(a.authenticated)
 
             self.assertTrue(a.refresh())
@@ -342,6 +343,35 @@ class NormalConnectionProcedure(unittest.TestCase):
             self.assertTrue(a.invalidate())
 
             self.assertEqual(_make_request_mock.call_count, 6)
+
+        # Test that we send a provided clientToken if the authenticationToken
+        # is initialized with one
+        with mock.patch("minecraft.authentication._make_request",
+                        side_effect=mocked_make_request) as _make_request_mock:
+            a = AuthenticationToken(client_token="existing_token")
+
+            self.assertTrue(a.authenticate("username", "password",
+                                           invalidate_previous=False))
+
+            self.assertEqual(_make_request_mock.call_count, 1)
+            self.assertEqual(
+                "existing_token",
+                _make_request_mock.call_args[0][2]["clientToken"]
+            )
+
+        # Test that we invalidate previous tokens properly
+        with mock.patch("minecraft.authentication._make_request",
+                        side_effect=mocked_make_request) as _make_request_mock:
+            a = AuthenticationToken()
+
+            self.assertFalse(a.authenticated)
+            self.assertTrue(a.authenticate("username", "password",
+                                           invalidate_previous=True))
+
+            self.assertTrue(a.authenticated)
+            self.assertEqual(a.access_token, "token")
+            self.assertEqual(_make_request_mock.call_count, 1)
+            self.assertNotIn("clientToken", _make_request_mock.call_args[0][2])
 
         a = AuthenticationToken(username="username",
                                 access_token="token",

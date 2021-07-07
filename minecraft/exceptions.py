@@ -49,5 +49,36 @@ class YggdrasilError(Exception):
     """
 
 
-class VersionMismatch(Exception):
-    pass
+class ConnectionFailure(Exception):
+    """Raised by 'minecraft.networking.Connection' when a connection attempt
+       fails.
+    """
+
+
+class VersionMismatch(ConnectionFailure):
+    """Raised by 'minecraft.networking.Connection' when connection is not
+       possible due to a difference between the server's and client's
+       supported protocol versions.
+    """
+
+
+class LoginDisconnect(ConnectionFailure):
+    """Raised by 'minecraft.networking.Connection' when a connection attempt
+       is terminated by the server sending a Disconnect packet, during login,
+       with an unknown message format.
+    """
+
+
+class InvalidState(ConnectionFailure):
+    """Raised by 'minecraft.networking.Connection' when a connection attempt
+       fails due to to the internal state of the Connection being unsuitable,
+       for example if there is an existing ongoing connection.
+    """
+
+
+class IgnorePacket(Exception):
+    """This exception may be raised from within a packet handler, such as
+       `PacketReactor.react' or a packet listener added with
+       `Connection.register_packet_listener', to stop any subsequent handlers
+       from being called on that particular packet.
+    """

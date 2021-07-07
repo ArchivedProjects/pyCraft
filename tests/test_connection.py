@@ -1,321 +1,480 @@
-from __future__ import print_function
+from minecraft import (
+    SUPPORTED_MINECRAFT_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS,
+    PROTOCOL_VERSION_INDICES,
+)
+from minecraft.networking.packets import clientbound, serverbound
+from minecraft.networking.connection import Connection
+from minecraft.exceptions import (
+    VersionMismatch, LoginDisconnect, InvalidState, IgnorePacket
+)
 
-from minecraft import SUPPORTED_MINECRAFT_VERSIONS
-from minecraft.networking import connection
-from minecraft.networking import types
-from minecraft.networking import packets
+from . import fake_server
 
-from future.utils import raise_
-
-import unittest
-import threading
-import logging
-import socket
-import json
 import sys
-
-VERSIONS = sorted(SUPPORTED_MINECRAFT_VERSIONS.items(), key=lambda i: i[1])
-THREAD_TIMEOUT_S = 5
-
-
-class _ConnectTest(unittest.TestCase):
-    def _test_connect(self, client_version=None, server_version=None):
-        server = FakeServer(minecraft_version=server_version)
-        addr, port = server.listen_socket.getsockname()
-
-        cond = threading.Condition()
-
-        def handle_client_exception(exc, exc_info):
-            with cond:
-                cond.exc_info = exc_info
-                cond.notify_all()
-
-        def client_write(packet, *args, **kwds):
-            def packet_write(*args, **kwds):
-                logging.debug('[C-> ] %s' % packet)
-                return real_packet_write(*args, **kwds)
-            real_packet_write = packet.write
-            packet.write = packet_write
-            return real_client_write(packet, *args, **kwds)
-
-        def client_react(packet, *args, **kwds):
-            logging.debug('[ ->C] %s' % packet)
-            return real_client_react(packet, *args, **kwds)
-
-        client = connection.Connection(
-            addr, port, username='User', initial_version=client_version,
-            handle_exception=handle_client_exception)
-        real_client_react = client._react
-        real_client_write = client.write_packet
-        client.write_packet = client_write
-        client._react = client_react
-
-        try:
-            with cond:
-                server_thread = threading.Thread(
-                    name='_ConnectTest server',
-                    target=self._test_connect_server,
-                    args=(server, cond))
-                server_thread.daemon = True
-                server_thread.start()
-
-                self._test_connect_client(client, cond)
-
-                cond.exc_info = Ellipsis
-                cond.wait(THREAD_TIMEOUT_S)
-                if cond.exc_info is Ellipsis:
-                    self.fail('Timed out.')
-                elif cond.exc_info is not None:
-                    raise_(*cond.exc_info)
-        finally:
-            # Wait for all threads to exit.
-            for thread in server_thread, client.networking_thread:
-                if thread is not None and thread.is_alive():
-                    thread.join(THREAD_TIMEOUT_S)
-                if thread is not None and thread.is_alive():
-                    if cond.exc_info is None:
-                        self.fail('Thread "%s" timed out.' % thread.name)
-                    else:
-                        # Keep the earlier exception, if there is one.
-                        break
-
-    def _test_connect_client(self, client, cond):
-        client.connect()
-
-    def _test_connect_server(self, server, cond):
-        try:
-            server.run()
-            exc_info = None
-        except:
-            exc_info = sys.exc_info()
-        with cond:
-            cond.exc_info = exc_info
-            cond.notify_all()
+import re
+import io
 
 
-class ConnectOldToOldTest(_ConnectTest):
-    def runTest(self):
-        self._test_connect(VERSIONS[0][1], VERSIONS[0][0])
-
-
-class ConnectOldToNewTest(_ConnectTest):
-    def runTest(self):
-        self._test_connect(VERSIONS[0][1], VERSIONS[-1][0])
-
-
-class ConnectNewToOldTest(_ConnectTest):
-    def runTest(self):
-        self._test_connect(VERSIONS[-1][1], VERSIONS[0][0])
-
-
-class ConnectNewToNewTest(_ConnectTest):
-    def runTest(self):
-        self._test_connect(VERSIONS[-1][1], VERSIONS[-1][0])
-
-
-class PingTest(_ConnectTest):
-    def runTest(self):
+class ConnectTest(fake_server._FakeServerTest):
+    def test_connect(self):
         self._test_connect()
 
-    def _test_connect_client(self, client, cond):
+    class client_handler_type(fake_server.FakeClientHandler):
+        def handle_play_start(self):
+            super(ConnectTest.client_handler_type, self).handle_play_start()
+            self.write_packet(clientbound.play.KeepAlivePacket(
+                keep_alive_id=1223334444))
+
+        def handle_play_packet(self, packet):
+            super(ConnectTest.client_handler_type, self) \
+                .handle_play_packet(packet)
+            if isinstance(packet, serverbound.play.KeepAlivePacket):
+                assert packet.keep_alive_id == 1223334444
+                raise fake_server.FakeServerDisconnect
+
+
+class ReconnectTest(ConnectTest):
+    phase = 0
+
+    def _start_client(self, client):
+        def handle_login_disconnect(packet):
+            if 'Please reconnect' in packet.json_data:
+                # Override the default behaviour of raising a fatal exception.
+                client.disconnect()
+                client.connect()
+                raise IgnorePacket
+        client.register_packet_listener(
+            handle_login_disconnect, clientbound.login.DisconnectPacket,
+            early=True)
+
+        def handle_play_disconnect(packet):
+            if 'Please reconnect' in packet.json_data:
+                client.connect()
+            elif 'Test successful' in packet.json_data:
+                raise fake_server.FakeServerTestSuccess
+        client.register_packet_listener(
+            handle_play_disconnect, clientbound.play.DisconnectPacket)
+
+        client.connect()
+
+    class client_handler_type(fake_server.FakeClientHandler):
+        def handle_login(self, packet):
+            if self.server.test_case.phase == 0:
+                self.server.test_case.phase = 1
+                raise fake_server.FakeServerDisconnect('Please reconnect (0).')
+            super(ReconnectTest.client_handler_type, self).handle_login(packet)
+
+        def handle_play_start(self):
+            if self.server.test_case.phase == 1:
+                self.server.test_case.phase = 2
+                raise fake_server.FakeServerDisconnect('Please reconnect (1).')
+            else:
+                assert self.server.test_case.phase == 2
+                raise fake_server.FakeServerDisconnect('Test successful (2).')
+
+
+class PingTest(ConnectTest):
+    def _start_client(self, client):
         def handle_ping(latency_ms):
             assert 0 <= latency_ms < 60000
-            with cond:
-                cond.exc_info = None
-                cond.notify_all()
+            raise fake_server.FakeServerTestSuccess
         client.status(handle_status=False, handle_ping=handle_ping)
 
-    def _test_connect_server(self, server, cond):
-        try:
-            server.continue_after_status = False
-            server.run()
-        except:
-            with cond:
-                cond.exc_info = sys.exc_info()
-                cond.notify_all()
+
+class StatusTest(ConnectTest):
+    def _start_client(self, client):
+        def handle_status(status_dict):
+            assert status_dict['description'] == {'text': 'FakeServer'}
+            raise fake_server.FakeServerTestSuccess
+        client.status(handle_status=handle_status, handle_ping=False)
 
 
-class FakeServer(threading.Thread):
-    __slots__ = 'context', 'minecraft_version', 'listen_socket', \
-                'packets_login', 'packets_playing', 'packets_status', \
-                'packets',
+class DefaultStatusTest(ConnectTest):
+    def setUp(self):
+        class FakeStdOut(io.BytesIO):
+            def write(self, data):
+                if isinstance(data, str):
+                    data = data.encode('utf8')
+                super(FakeStdOut, self).write(data)
+        sys.stdout, self.old_stdout = FakeStdOut(), sys.stdout
 
-    def __init__(self, minecraft_version=None, continue_after_status=True):
-        if minecraft_version is None:
-            minecraft_version = VERSIONS[-1][0]
-        self.minecraft_version = minecraft_version
-        self.continue_after_status = continue_after_status
-        protocol_version = SUPPORTED_MINECRAFT_VERSIONS[minecraft_version]
-        self.context = connection.ConnectionContext(
-            protocol_version=protocol_version)
+    def tearDown(self):
+        sys.stdout, self.old_stdout = self.old_stdout, None
 
-        self.packets_handshake = {
-            p.get_id(self.context): p for p in
-            packets.state_handshake_serverbound(self.context)}
+    def _start_client(self, client):
+        def handle_exit():
+            output = sys.stdout.getvalue()
+            assert re.match(b'{.*}\\nPing: \\d+ ms\\n$', output), \
+                'Invalid stdout contents: %r.' % output
+            raise fake_server.FakeServerTestSuccess
+        client.handle_exit = handle_exit
 
-        self.packets_login = {
-            p.get_id(self.context): p for p in
-            packets.state_login_serverbound(self.context)}
+        client.status(handle_status=None, handle_ping=None)
 
-        self.packets_playing = {
-            p.get_id(self.context): p for p in
-            packets.state_playing_serverbound(self.context)}
 
-        self.packets_status = {
-            p.get_id(self.context): p for p in
-            packets.state_status_serverbound(self.context)}
+class ConnectCompressionLowTest(ConnectTest):
+    compression_threshold = 0
 
-        self.listen_socket = socket.socket()
-        self.listen_socket.bind(('0.0.0.0', 0))
-        self.listen_socket.listen(0)
 
-        super(FakeServer, self).__init__()
+class ConnectCompressionHighTest(ConnectTest):
+    compression_threshold = 256
 
-    def run(self):
-        try:
-            self.run_accept()
-        finally:
-            self.listen_socket.close()
 
-    def run_accept(self):
-        running = True
-        while running:
-            client_socket, addr = self.listen_socket.accept()
-            logging.debug('[ ++ ] Client %s connected to server.' % (addr,))
-            client_file = client_socket.makefile('rb', 0)
-            try:
-                running = self.run_handshake(client_socket, client_file)
-            except:
-                raise
+class AllowedVersionsTest(fake_server._FakeServerTest):
+    versions = list(SUPPORTED_MINECRAFT_VERSIONS.items())
+    test_indices = (0, len(versions) // 2, len(versions) - 1)
+
+    client_handler_type = ConnectTest.client_handler_type
+
+    def test_with_version_names(self):
+        for index in self.test_indices:
+            self._test_connect(
+                server_version=self.versions[index][0],
+                client_versions={v[0] for v in self.versions[:index+1]})
+
+    def test_with_protocol_numbers(self):
+        for index in self.test_indices:
+            self._test_connect(
+                server_version=self.versions[index][0],
+                client_versions={v[1] for v in self.versions[:index+1]})
+
+
+class LoginDisconnectTest(fake_server._FakeServerTest):
+    def test_login_disconnect(self):
+        with self.assertRaisesRegexp(LoginDisconnect, r'You are banned'):
+            self._test_connect()
+
+    class client_handler_type(fake_server.FakeClientHandler):
+        def handle_login(self, login_start_packet):
+            raise fake_server.FakeServerDisconnect('You are banned.')
+
+
+class ConnectTwiceTest(fake_server._FakeServerTest):
+    def test_connect(self):
+        with self.assertRaisesRegexp(InvalidState, 'existing connection'):
+            self._test_connect()
+
+    class client_handler_type(fake_server.FakeClientHandler):
+        def handle_play_start(self):
+            super(ConnectTwiceTest.client_handler_type, self) \
+                .handle_play_start()
+            raise fake_server.FakeServerDisconnect('Test complete.')
+
+    def _start_client(self, client):
+        client.connect()
+        client.connect()
+
+
+class ConnectStatusTest(ConnectTwiceTest):
+    def _start_client(self, client):
+        client.connect()
+        client.status()
+
+
+class LoginPluginTest(fake_server._FakeServerTest):
+    class client_handler_type(fake_server.FakeClientHandler):
+        def handle_login(self, login_start_packet):
+            request = clientbound.login.PluginRequestPacket(
+                message_id=1, channel='pyCraft:tests/fail', data=b'ignored')
+            self.write_packet(request)
+            response = self.read_packet()
+            assert isinstance(response, serverbound.login.PluginResponsePacket)
+            assert response.message_id == request.message_id
+            assert response.successful is False
+            assert response.data is None
+
+            request = clientbound.login.PluginRequestPacket(
+                message_id=2, channel='pyCraft:tests/echo', data=b'hello')
+            self.write_packet(request)
+            response = self.read_packet()
+            assert isinstance(response, serverbound.login.PluginResponsePacket)
+            assert response.message_id == request.message_id
+            assert response.successful is True
+            assert response.data == request.data
+
+            super(LoginPluginTest.client_handler_type, self) \
+                .handle_login(login_start_packet)
+
+        def handle_play_start(self):
+            super(LoginPluginTest.client_handler_type, self) \
+                .handle_play_start()
+            raise fake_server.FakeServerDisconnect
+
+    def _start_client(self, client):
+        def handle_plugin_request(packet):
+            if packet.channel == 'pyCraft:tests/echo':
+                client.write_packet(serverbound.login.PluginResponsePacket(
+                    message_id=packet.message_id, data=packet.data))
+                raise IgnorePacket
+        client.register_packet_listener(
+            handle_plugin_request, clientbound.login.PluginRequestPacket,
+            early=True)
+
+        super(LoginPluginTest, self)._start_client(client)
+
+    def test_login_plugin_messages(self):
+        self._test_connect()
+
+
+class EarlyPacketListenerTest(ConnectTest):
+    """ Early packet listeners should be called before ordinary ones, even when
+        the early packet listener is registered afterwards.
+    """
+    def _start_client(self, client):
+        @client.listener(clientbound.play.JoinGamePacket)
+        def handle_join(packet):
+            assert early_handle_join.called, \
+                   'Ordinary listener called before early listener.'
+            handle_join.called = True
+        handle_join.called = False
+
+        @client.listener(clientbound.play.JoinGamePacket, early=True)
+        def early_handle_join(packet):
+            early_handle_join.called = True
+        early_handle_join.called = False
+
+        @client.listener(clientbound.play.DisconnectPacket)
+        def handle_disconnect(packet):
+            assert early_handle_join.called, 'Early listener not called.'
+            assert handle_join.called, 'Ordinary listener not called.'
+            raise fake_server.FakeServerTestSuccess
+
+        client.connect()
+
+
+class IgnorePacketTest(ConnectTest):
+    """ Raising 'minecraft.networking.connection.IgnorePacket' from within a
+        packet listener should prevent any subsequent packet listeners from
+        being called, and, if the listener is early, should prevent the default
+        behaviour from being triggered.
+    """
+
+    def _start_client(self, client):
+        keep_alive_ids_incoming = []
+        keep_alive_ids_outgoing = []
+
+        def handle_keep_alive_1(packet):
+            keep_alive_ids_incoming.append(packet.keep_alive_id)
+            if packet.keep_alive_id == 1:
+                raise IgnorePacket
+        client.register_packet_listener(
+            handle_keep_alive_1, clientbound.play.KeepAlivePacket, early=True)
+
+        def handle_keep_alive_2(packet):
+            keep_alive_ids_incoming.append(packet.keep_alive_id)
+            assert packet.keep_alive_id > 1
+            if packet.keep_alive_id == 2:
+                raise IgnorePacket
+        client.register_packet_listener(
+            handle_keep_alive_2, clientbound.play.KeepAlivePacket)
+
+        def handle_keep_alive_3(packet):
+            keep_alive_ids_incoming.append(packet.keep_alive_id)
+            assert packet.keep_alive_id == 3
+        client.register_packet_listener(
+            handle_keep_alive_3, clientbound.play.KeepAlivePacket)
+
+        def handle_outgoing_keep_alive_2(packet):
+            keep_alive_ids_outgoing.append(packet.keep_alive_id)
+            assert 2 <= packet.keep_alive_id <= 3
+            if packet.keep_alive_id == 2:
+                raise IgnorePacket
+        client.register_packet_listener(
+            handle_outgoing_keep_alive_2, serverbound.play.KeepAlivePacket,
+            outgoing=True, early=True)
+
+        def handle_outgoing_keep_alive_3(packet):
+            keep_alive_ids_outgoing.append(packet.keep_alive_id)
+            assert packet.keep_alive_id == 3
+            raise IgnorePacket
+        client.register_packet_listener(
+            handle_outgoing_keep_alive_3, serverbound.play.KeepAlivePacket,
+            outgoing=True)
+
+        def handle_outgoing_keep_alive_none(packet):
+            keep_alive_ids_outgoing.append(packet.keep_alive_id)
+            assert False
+        client.register_packet_listener(
+            handle_outgoing_keep_alive_none, serverbound.play.KeepAlivePacket,
+            outgoing=True)
+
+        def handle_disconnect(packet):
+            assert keep_alive_ids_incoming == [1, 2, 2, 3, 3, 3], \
+                'Incoming keep-alive IDs %r != %r' % \
+                (keep_alive_ids_incoming, [1, 2, 2, 3, 3, 3])
+            assert keep_alive_ids_outgoing == [2, 3, 3], \
+                'Outgoing keep-alive IDs %r != %r' % \
+                (keep_alive_ids_incoming, [2, 3, 3])
+        client.register_packet_listener(
+            handle_disconnect, clientbound.play.DisconnectPacket)
+
+        client.connect()
+
+    class client_handler_type(fake_server.FakeClientHandler):
+        __slots__ = '_keep_alive_ids_returned'
+
+        def __init__(self, *args, **kwds):
+            super(IgnorePacketTest.client_handler_type, self).__init__(
+                *args, **kwds)
+            self._keep_alive_ids_returned = []
+
+        def handle_play_start(self):
+            super(IgnorePacketTest.client_handler_type, self)\
+                .handle_play_start()
+            self.write_packet(clientbound.play.KeepAlivePacket(
+                keep_alive_id=1))
+            self.write_packet(clientbound.play.KeepAlivePacket(
+                keep_alive_id=2))
+            self.write_packet(clientbound.play.KeepAlivePacket(
+                keep_alive_id=3))
+            self.handle_play_server_disconnect('Test complete.')
+
+        def handle_play_packet(self, packet):
+            super(IgnorePacketTest.client_handler_type, self) \
+                .handle_play_packet(packet)
+            if isinstance(packet, serverbound.play.KeepAlivePacket):
+                self._keep_alive_ids_returned.append(packet.keep_alive_id)
+
+        def handle_play_client_disconnect(self):
+            assert self._keep_alive_ids_returned == [3], \
+                   'Returned keep-alive IDs %r != %r' % \
+                   (self._keep_alive_ids_returned, [3])
+            raise fake_server.FakeServerTestSuccess
+
+
+class HandleExceptionTest(ConnectTest):
+    ignore_extra_exceptions = True
+
+    def _start_client(self, client):
+        message = 'Min skoldpadda ar inte snabb, men den ar en skoldpadda.'
+
+        @client.listener(clientbound.login.LoginSuccessPacket)
+        def handle_login_success(_packet):
+            raise Exception(message)
+
+        @client.exception_handler(early=True)
+        def handle_exception(exc, _exc_info):
+            assert isinstance(exc, Exception) and exc.args == (message,)
+            raise fake_server.FakeServerTestSuccess
+
+        client.connect()
+
+
+class ExceptionReconnectTest(ConnectTest):
+    class CustomException(Exception):
+        pass
+
+    def setUp(self):
+        self.phase = 0
+
+    def _start_client(self, client):
+        @client.listener(clientbound.play.JoinGamePacket)
+        def handle_join_game(packet):
+            if self.phase == 0:
+                self.phase += 1
+                raise self.CustomException
             else:
-                client_socket.shutdown(socket.SHUT_RDWR)
-                logging.debug('[ -- ] Client %s disconnected.' % (addr,))
-            finally:
-                client_socket.close()
-                client_file.close()
+                raise fake_server.FakeServerTestSuccess
 
-    def run_handshake(self, client_socket, client_file):
-        self.packets = self.packets_handshake
-        packet = self.read_packet_filtered(client_file)
-        assert isinstance(packet, packets.HandShakePacket)
-        if packet.next_state == 1:
-            return self.run_handshake_status(
-                packet, client_socket, client_file)
-        elif packet.next_state == 2:
-            return self.run_handshake_play(
-                packet, client_socket, client_file)
-        else:
-            raise AssertionError('Unknown state: %s' % packet.next_state)
+        @client.exception_handler(self.CustomException, early=True)
+        def handle_custom_exception(exc, exc_info):
+            client.disconnect(immediate=True)
+            client.connect()
 
-    def run_handshake_status(self, packet, client_socket, client_file):
-        self.run_status(client_socket, client_file)
-        return self.continue_after_status
+        client.connect()
 
-    def run_handshake_play(self, packet, client_socket, client_file):
-        if packet.protocol_version == self.context.protocol_version:
-            self.run_login(client_socket, client_file)
-        else:
-            if packet.protocol_version < self.context.protocol_version:
-                msg = 'Outdated client! Please use %s' \
-                      % self.minecraft_version
-            else:
-                msg = "Outdated server! I'm still on %s" \
-                      % self.minecraft_version
-            packet = packets.DisconnectPacket(
-                self.context, json_data=json.dumps({'text': msg}))
-            self.write_packet(packet, client_socket)
+    class client_handler_type(ConnectTest.client_handler_type):
+        def handle_abnormal_disconnect(self, exc):
             return True
 
-    def run_login(self, client_socket, client_file):
-        self.packets = self.packets_login
-        packet = self.read_packet_filtered(client_file)
-        assert isinstance(packet, packets.LoginStartPacket)
 
-        packet = packets.LoginSuccessPacket(
-            self.context, UUID='{fake uuid}', Username=packet.name)
-        self.write_packet(packet, client_socket)
-        self.run_playing(client_socket, client_file)
+class VersionNegotiationEdgeCases(fake_server._FakeServerTest):
+    earliest_version = SUPPORTED_PROTOCOL_VERSIONS[0]
+    latest_version = SUPPORTED_PROTOCOL_VERSIONS[-1]
 
-    def run_playing(self, client_socket, client_file):
-        self.packets = self.packets_playing
+    fake_version = max(PROTOCOL_VERSION_INDICES.keys()) + 1
+    fake_version_index = max(PROTOCOL_VERSION_INDICES.values()) + 1
 
-        packet = packets.JoinGamePacket(
-            self.context, entity_id=0, game_mode=0, dimension=0, difficulty=2,
-            max_players=1, level_type='default', reduced_debug_info=False)
-        self.write_packet(packet, client_socket)
+    def setUp(self):
+        PROTOCOL_VERSION_INDICES[self.fake_version] = self.fake_version_index
+        super(VersionNegotiationEdgeCases, self).setUp()
 
-        keep_alive_id = 1076048782
-        packet = packets.KeepAlivePacketClientbound(
-            self.context, keep_alive_id=keep_alive_id)
-        self.write_packet(packet, client_socket)
+    def tearDown(self):
+        super(VersionNegotiationEdgeCases, self).tearDown()
+        del PROTOCOL_VERSION_INDICES[self.fake_version]
 
-        packet = self.read_packet_filtered(client_file)
-        assert isinstance(packet, packets.KeepAlivePacketServerbound)
-        assert packet.keep_alive_id == keep_alive_id
+    def test_client_protocol_unsupported(self):
+        self._test_client_protocol(version=self.fake_version)
 
-        packet = packets.DisconnectPacketPlayState(
-            self.context, json_data=json.dumps({'text': 'Test complete.'}))
-        self.write_packet(packet, client_socket)
-        return False
+    def test_client_protocol_unknown(self):
+        self._test_client_protocol(version='surprise me!')
 
-    def run_status(self, client_socket, client_file):
-        self.packets = self.packets_status
+    def test_client_protocol_invalid(self):
+        self._test_client_protocol(version=object())
 
-        packet = self.read_packet(client_file)
-        assert isinstance(packet, packets.RequestPacket)
+    def _test_client_protocol(self, version):
+        with self.assertRaisesRegexp(ValueError, 'Unsupported version'):
+            self._test_connect(client_versions={version})
 
-        packet = packets.ResponsePacket(self.context)
-        packet.json_response = json.dumps({
-            'version': {
-                'name':     self.minecraft_version,
-                'protocol': self.context.protocol_version},
-            'players': {
-                'max':      1,
-                'online':   0,
-                'sample':   []},
-            'description': {
-                'text':     'FakeServer'}})
-        self.write_packet(packet, client_socket)
+    def test_server_protocol_unsupported(self, client_versions=None):
+        with self.assertRaisesRegexp(VersionMismatch, 'not supported'):
+            self._test_connect(client_versions=client_versions,
+                               server_version=self.fake_version)
 
-        try:
-            packet = self.read_packet(client_file)
-        except EOFError:
-            return False
-        assert isinstance(packet, packets.PingPacket)
+    def test_server_protocol_unsupported_direct(self):
+        self.test_server_protocol_unsupported({self.latest_version})
 
-        res_packet = packets.PingPacketResponse(self.context)
-        res_packet.time = packet.time
-        self.write_packet(res_packet, client_socket)
-        return False
+    def test_server_protocol_disallowed(self, client_versions=None):
+        if client_versions is None:
+            client_versions = set(SUPPORTED_PROTOCOL_VERSIONS) \
+                              - {self.latest_version}
+        with self.assertRaisesRegexp(VersionMismatch, 'not allowed'):
+            self._test_connect(client_versions={self.earliest_version},
+                               server_version=self.latest_version)
 
-    def read_packet_filtered(self, client_file):
-        while True:
-            packet = self.read_packet(client_file)
-            if isinstance(packet, packets.PositionAndLookPacket):
-                continue
-            if isinstance(packet, packets.AnimationPacketServerbound):
-                continue
-            return packet
+    def test_server_protocol_disallowed_direct(self):
+        self.test_server_protocol_disallowed({self.earliest_version})
 
-    def read_packet(self, client_file):
-        buffer = self.read_packet_buffer(client_file)
-        packet_id = types.VarInt.read(buffer)
-        if packet_id in self.packets:
-            packet = self.packets[packet_id](self.context)
-            packet.read(buffer)
-        else:
-            packet = packets.Packet(self.context, id=packet_id)
-        logging.debug('[ ->S] %s' % packet)
-        return packet
+    def test_default_protocol_version(self, status_response=None):
+        if status_response is None:
+            status_response = '{"description": {"text": "FakeServer"}}'
 
-    def read_packet_buffer(self, client_file):
-        length = types.VarInt.read(client_file)
-        buffer = packets.PacketBuffer()
-        while len(buffer.get_writable()) < length:
-            buffer.send(client_file.read(length - len(buffer.get_writable())))
-        buffer.reset_cursor()
-        return buffer
+        class ClientHandler(fake_server.FakeClientHandler):
+            def handle_status(self, request_packet):
+                packet = clientbound.status.ResponsePacket()
+                packet.json_response = status_response
+                self.write_packet(packet)
 
-    def write_packet(self, packet, client_socket):
-        packet.write(client_socket)
-        logging.debug('[S-> ] %s' % packet)
+            def handle_play_start(self):
+                super(ClientHandler, self).handle_play_start()
+                raise fake_server.FakeServerDisconnect('Test complete.')
+
+        def make_connection(*args, **kwds):
+            kwds['initial_version'] = self.earliest_version
+            return Connection(*args, **kwds)
+
+        self._test_connect(server_version=self.earliest_version,
+                           client_handler_type=ClientHandler,
+                           connection_type=make_connection)
+
+    def test_default_protocol_version_empty(self):
+        with self.assertRaisesRegexp(IOError, 'Invalid server status'):
+            self.test_default_protocol_version(status_response='{}')
+
+    def test_default_protocol_version_eof(self):
+        class ClientHandler(fake_server.FakeClientHandler):
+            def handle_status(self, request_packet):
+                raise fake_server.FakeServerDisconnect(
+                      'Refusing to handle status request, for test purposes.')
+
+            def handle_play_start(self):
+                super(ClientHandler, self).handle_play_start()
+                raise fake_server.FakeServerDisconnect('Test complete.')
+
+        def make_connection(*args, **kwds):
+            kwds['initial_version'] = self.earliest_version
+            return Connection(*args, **kwds)
+
+        self._test_connect(server_version=self.earliest_version,
+                           client_handler_type=ClientHandler,
+                           connection_type=make_connection)
